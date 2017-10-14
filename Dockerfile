@@ -1,4 +1,5 @@
-FROM bluelens/python:3.6
+FROM bluelens/tensorflow:1.3.0
+
 
 
 

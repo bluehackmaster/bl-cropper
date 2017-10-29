@@ -359,3 +359,5 @@ crashlytics.properties
 crashlytics-build.properties
 fabric.properties
 
+./model/frozen_inference_graph.pb
+./model/label_map.pbtxt

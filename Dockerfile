@@ -9,6 +9,9 @@ WORKDIR /usr/src/app
 
 COPY . /usr/src/app
 
+RUN curl https://s3.ap-northeast-2.amazonaws.com/bluelens-style-model/object_detection/frozen_inference_graph.pb -o /usr/src/app/model/frozen_inference_graph.pb
+RUN curl https://s3.ap-northeast-2.amazonaws.com/bluelens-style-model/object_detection/label_map.pbtxt -o /usr/src/app/model/label_map.pbtxt
+
 RUN pip install -r requirements.txt
 RUN pip install --no-cache-dir google
 

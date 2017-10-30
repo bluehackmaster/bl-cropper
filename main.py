@@ -1,18 +1,15 @@
 from __future__ import print_function
-import uuid
 
 import os
-from google.cloud import bigquery
 
 import numpy as np
-import argparse
-import multiprocessing
 import tensorflow as tf
 from PIL import Image
 import urllib
 import redis
 import json
 import time
+import signal
 import stylelens_index
 from stylelens_index.rest import ApiException
 from pprint import pprint
@@ -27,6 +24,8 @@ except ImportError:
 
 AWS_BUCKET = 'bluelens-style-object'
 
+REDIS_IMAGE_INDEX_QUEUE = 'bl:image:index:queue'
+
 TMP_CROP_IMG_FILE = './tmp.jpg'
 
 CWD_PATH = os.getcwd()
@@ -40,10 +39,10 @@ OD_LABELS = os.environ['OD_LABELS']
 NUM_CLASSES = 89
 
 HOST_URL = 'host_url'
-TAG = 'tag'
+TAGS = 'tags'
 SUB_CATEGORY = 'sub_category'
 PRODUCT_NAME = 'product_name'
-IMAGE_URL = 'image_url'
+IMAGE = 'image'
 PRODUCT_PRICE = 'product_price'
 CURRENCY_UNIT = 'currency_unit'
 PRODUCT_URL = 'product_url'
@@ -51,8 +50,13 @@ PRODUCT_NO = 'product_no'
 MAIN = 'main'
 NATION = 'nation'
 
-REDIS_KEY_IMAGE_QUEUE = 'image_queue'
-REDIS_KEY_IMAGE_INFO = 'image_info'
+REDIS_IMAGE_CROP_QUEUE = 'bl:image:crop:queue'
+
+STR_BUCKET = "bucket"
+STR_STORAGE = "storage"
+STR_CLASS_CODE = "class_code"
+STR_NAME = "name"
+STR_FORMAT = "format"
 
 # Loading label map
 label_map = label_map_util.load_labelmap(OD_LABELS)
@@ -63,66 +67,85 @@ category_index = label_map_util.create_category_index(categories)
 api_instance = stylelens_index.ImageApi()
 
 REDIS_SERVER = os.environ['REDIS_SERVER']
+
 rconn = redis.StrictRedis(REDIS_SERVER)
 
-def query():
-    client = bigquery.Client.from_service_account_json(
-        'BlueLens-d8117bd9e6b1.json')
 
-    detection_graph = tf.Graph()
-    with detection_graph.as_default():
-        od_graph_def = tf.GraphDef()
-        with tf.gfile.GFile(OD_MODEL, 'rb') as fid:
-            serialized_graph = fid.read()
-            od_graph_def.ParseFromString(serialized_graph)
-            tf.import_graph_def(od_graph_def, name='')
+def job():
 
-        sess = tf.Session(graph=detection_graph)
+  detection_graph = tf.Graph()
+  with detection_graph.as_default():
+      od_graph_def = tf.GraphDef()
+      with tf.gfile.GFile(OD_MODEL, 'rb') as fid:
+          serialized_graph = fid.read()
+          od_graph_def.ParseFromString(serialized_graph)
+          tf.import_graph_def(od_graph_def, name='')
 
-    # query = 'SELECT * FROM stylelens.8seconds LIMIT 100'
-    query = 'SELECT * FROM stylelens.8seconds'
+      sess = tf.Session(graph=detection_graph)
 
-    query_job = client.run_async_query(str(uuid.uuid4()), query)
-
-    query_job.begin()
-    query_job.result()  # Wait for job to complete.
-
-    # Print the results.
-    destination_table = query_job.destination
-    destination_table.reload()
-    for row in destination_table.fetch_data():
-        image_info = stylelens_index.Image()
-        image_info.host_url = str(row[0])
-        image_info.tags = str(row[1]).split(',')
-        image_info.product_name = str(row[3])
-        image_info.image_url = str(row[4])
-        image_info.product_price = str(row[5])
-        image_info.currency_unit = str(row[6])
-        image_info.product_url = str(row[7])
-        image_info.product_no = str(row[8])
-        image_info.main = int(row[9])
-        image_info.nation = str(row[10])
-        image_info.bucket = AWS_BUCKET
-        f = urllib.request.urlopen(image_info.image_url)
-        img = Image.open(f)
-        image_np = load_image_into_numpy_array(img)
-
-        show_box = False
-        out_image, boxes, scores, classes, num_detections = detect_objects(image_np, sess, detection_graph, show_box)
-
-        take_object(image_info,
-                    out_image,
-                    np.squeeze(boxes),
-                    np.squeeze(scores),
-                    np.squeeze(classes).astype(np.int32))
-
-        if show_box:
-          img = Image.fromarray(out_image, 'RGB')
-          img.show()
+  def items():
+    while True:
+      yield rconn.blpop([REDIS_IMAGE_CROP_QUEUE])
 
 
-    redis_pub()
-    sess.close()
+  def request_stop(signum, frame):
+    print('stopping')
+    stop_requested = True
+    rconn.connection_pool.disconnect()
+    print('connection closed')
+
+  signal.signal(signal.SIGINT, request_stop)
+  signal.signal(signal.SIGTERM, request_stop)
+
+  for item in items():
+    key, image_data = item
+    if type(image_data) is str:
+      image_info = json.loads(image_data)
+    elif type(image_data) is bytes:
+      image_info = json.loads(image_data.decode('utf-8'))
+
+    image = stylelens_index.Image()
+
+    image.name = image_info['name']
+    image.host_url = image_info['host_url']
+    image.host_code = image_info['host_code']
+    image.tags = image_info['tags']
+    image.format = image_info['format']
+    image.product_name = image_info['product_name']
+    image.parent_image_raw = image_info['parent_image_raw']
+    image.parent_image_mobile = image_info['parent_image_mobile']
+    image.parent_image_mobile_thumb = image_info['parent_image_mobile_thumb']
+    image.image = image_info['image']
+    image.class_code = image_info['class_code']
+    image.bucket = image_info['bucket']
+    image.storage = image_info['storage']
+    image.product_price = image_info['product_price']
+    image.currency_unit = image_info['currency_unit']
+    image.product_url = image_info['product_url']
+    image.product_no = image_info['product_no']
+    image.main = image_info['main']
+    image.nation = image_info['nation']
+
+    f = urllib.request.urlopen(image.image)
+    img = Image.open(f)
+    image_np = load_image_into_numpy_array(img)
+
+    show_box = False
+    out_image, boxes, scores, classes, num_detections = detect_objects(image_np, sess, detection_graph, show_box)
+
+    take_object(image,
+                out_image,
+                np.squeeze(boxes),
+                np.squeeze(scores),
+                np.squeeze(classes).astype(np.int32))
+
+    if show_box:
+      img = Image.fromarray(out_image, 'RGB')
+      img.show()
+
+
+  redis_pub()
+  sess.close()
 
 def redis_pub():
   rconn.publish('crop/done', 'DONE')
@@ -162,32 +185,31 @@ def take_object(image_info, image_np, boxes, scores, classes):
 
 def save_to_redis(image_info):
   image = image_class_to_json(image_info)
-  rconn.hset(REDIS_KEY_IMAGE_INFO, image_info.name, image)
-  rconn.lpush(REDIS_KEY_IMAGE_QUEUE, image_info.name)
+  rconn.lpush(REDIS_IMAGE_INDEX_QUEUE, image)
 
 def image_class_to_json(image):
-  image_dic = {}
-  image_dic['name'] = image.name
-  image_dic['host_url'] = image.host_url
-  image_dic['host_code'] = image.host_code
-  image_dic['tags'] = image.tags
-  image_dic['format'] = image.format
-  image_dic['product_name'] = image.product_name
-  image_dic['parent_image_raw'] = image.parent_image_raw
-  image_dic['parent_image_mobile'] = image.parent_image_mobile
-  image_dic['parent_image_mobile_thumb'] = image.parent_image_mobile_thumb
-  image_dic['image'] = image.image
-  image_dic['class_code'] = image.class_code
-  image_dic['bucket'] = image.bucket
-  image_dic['storage'] = image.storage
-  image_dic['product_price'] = image.product_price
-  image_dic['currency_unit'] = image.currency_unit
-  image_dic['product_url'] = image.product_url
-  image_dic['product_no'] = image.product_no
-  image_dic['main'] = image.main
-  image_dic['nation'] = image.nation
+  image_info = {}
+  image_info['name'] = image.name
+  image_info['host_url'] = image.host_url
+  image_info['host_code'] = image.host_code
+  image_info['tags'] = image.tags
+  image_info['format'] = image.format
+  image_info['product_name'] = image.product_name
+  image_info['parent_image_raw'] = image.parent_image_raw
+  image_info['parent_image_mobile'] = image.parent_image_mobile
+  image_info['parent_image_mobile_thumb'] = image.parent_image_mobile_thumb
+  image_info['image'] = image.image
+  image_info['class_code'] = image.class_code
+  image_info['bucket'] = image.bucket
+  image_info['storage'] = image.storage
+  image_info['product_price'] = image.product_price
+  image_info['currency_unit'] = image.currency_unit
+  image_info['product_url'] = image.product_url
+  image_info['product_no'] = image.product_no
+  image_info['main'] = image.main
+  image_info['nation'] = image.nation
 
-  s = json.dumps(image_dic)
+  s = json.dumps(image_info)
   print(s)
   return s
 
@@ -293,23 +315,5 @@ def detect_objects(image_np, sess, detection_graph, show_box=True):
     return image_np, boxes, scores, classes, num_detections
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-src', '--source', dest='video_source', type=int,
-                        default=0, help='Device index of the camera.')
-    parser.add_argument('-wd', '--width', dest='width', type=int,
-                        default=480, help='Width of the frames in the video stream.')
-    parser.add_argument('-ht', '--height', dest='height', type=int,
-                        default=360, help='Height of the frames in the video stream.')
-    parser.add_argument('-num-w', '--num-workers', dest='num_workers', type=int,
-                        default=2, help='Number of workers.')
-    parser.add_argument('-q-size', '--queue-size', dest='queue_size', type=int,
-                        default=5, help='Size of the queue.')
-    args = parser.parse_args()
-
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(multiprocessing.SUBDEBUG)
-
-    query()
-    while True:
-      time.sleep(10)
+    job()
 

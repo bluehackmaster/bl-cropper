@@ -8,10 +8,13 @@ from PIL import Image
 import urllib
 import redis
 import json
+import logging
+from threading import Timer
 import time
 import signal
 import stylelens_index
 from stylelens_index.rest import ApiException
+from bluelens_spawning_pool import spawning_pool
 from pprint import pprint
 from util import label_map_util
 from object_detection.utils import visualization_utils as vis_util
@@ -35,6 +38,7 @@ AWS_SECRET_ACCESS_KEY = os.environ['AWS_SECRET_ACCESS_KEY'].replace('"', '')
 
 OD_MODEL = os.environ['OD_MODEL']
 OD_LABELS = os.environ['OD_LABELS']
+SPAWN_ID = os.environ['SPAWN_ID']
 
 NUM_CLASSES = 89
 
@@ -70,9 +74,12 @@ REDIS_SERVER = os.environ['REDIS_SERVER']
 
 rconn = redis.StrictRedis(REDIS_SERVER)
 
+logging.basicConfig(filename='./log/main.log', level=logging.DEBUG)
+heart_bit = True
 
 def job():
 
+  redis_pub('START')
   detection_graph = tf.Graph()
   with detection_graph.as_default():
       od_graph_def = tf.GraphDef()
@@ -143,12 +150,31 @@ def job():
       img = Image.fromarray(out_image, 'RGB')
       img.show()
 
+    global  heart_bit
+    heart_bit = True
 
-  redis_pub()
-  sess.close()
+def check_health():
+  print('check_health: ' + str(heart_bit))
+  logging.debug('check_health: ' + str(heart_bit))
+  global  heart_bit
+  if heart_bit == True:
+    heart_bit = False
+    Timer(60, check_health, ()).start()
+  else:
+    exit()
 
-def redis_pub():
-  rconn.publish('crop/done', 'DONE')
+def exit():
+  print('exit: ' + SPAWN_ID)
+  logging.debug('exit: ' + SPAWN_ID)
+  data = {}
+  data['namespace'] = 'index'
+  data['id'] = SPAWN_ID
+  spawn = spawning_pool.SpawningPool()
+  spawn.setServerUrl(REDIS_SERVER)
+  spawn.delete(data)
+
+def redis_pub(message):
+  rconn.publish('crop', message)
 
 
 def take_object(image_info, image_np, boxes, scores, classes):
@@ -315,5 +341,6 @@ def detect_objects(image_np, sess, detection_graph, show_box=True):
     return image_np, boxes, scores, classes, num_detections
 
 if __name__ == '__main__':
-    job()
+  Timer(60, check_health, ()).start()
+  job()
 

@@ -71,15 +71,14 @@ category_index = label_map_util.create_category_index(categories)
 api_instance = stylelens_index.ImageApi()
 
 REDIS_SERVER = os.environ['REDIS_SERVER']
+REDIS_PASSWORD = os.environ['REDIS_PASSWORD']
 
-rconn = redis.StrictRedis(REDIS_SERVER)
+rconn = redis.StrictRedis(REDIS_SERVER, port=6379, password=REDIS_PASSWORD)
 
 logging.basicConfig(filename='./log/main.log', level=logging.DEBUG)
 heart_bit = True
 
 def job():
-
-  redis_pub('START')
   detection_graph = tf.Graph()
   with detection_graph.as_default():
       od_graph_def = tf.GraphDef()
@@ -90,6 +89,7 @@ def job():
 
       sess = tf.Session(graph=detection_graph)
 
+  redis_pub('START')
   def items():
     while True:
       yield rconn.blpop([REDIS_IMAGE_CROP_QUEUE])
@@ -106,12 +106,16 @@ def job():
 
   for item in items():
     key, image_data = item
+    print(item)
+    image_info = {}
     if type(image_data) is str:
       image_info = json.loads(image_data)
     elif type(image_data) is bytes:
       image_info = json.loads(image_data.decode('utf-8'))
 
+    print('1')
     image = stylelens_index.Image()
+    print('2')
 
     image.name = image_info['name']
     image.host_url = image_info['host_url']
@@ -133,19 +137,23 @@ def job():
     image.main = image_info['main']
     image.nation = image_info['nation']
 
+    print('3')
     f = urllib.request.urlopen(image.image)
     img = Image.open(f)
     image_np = load_image_into_numpy_array(img)
+    # print(image_np)
 
     show_box = False
     out_image, boxes, scores, classes, num_detections = detect_objects(image_np, sess, detection_graph, show_box)
 
+    print('4')
     take_object(image,
                 out_image,
                 np.squeeze(boxes),
                 np.squeeze(scores),
                 np.squeeze(classes).astype(np.int32))
 
+    print('5')
     if show_box:
       img = Image.fromarray(out_image, 'RGB')
       img.show()
@@ -154,12 +162,12 @@ def job():
     heart_bit = True
 
 def check_health():
+  global  heart_bit
   print('check_health: ' + str(heart_bit))
   logging.debug('check_health: ' + str(heart_bit))
-  global  heart_bit
   if heart_bit == True:
     heart_bit = False
-    Timer(60, check_health, ()).start()
+    Timer(100, check_health, ()).start()
   else:
     exit()
 
@@ -171,6 +179,7 @@ def exit():
   data['id'] = SPAWN_ID
   spawn = spawning_pool.SpawningPool()
   spawn.setServerUrl(REDIS_SERVER)
+  spawn.setServerPassword(REDIS_PASSWORD)
   spawn.delete(data)
 
 def redis_pub(message):
@@ -240,11 +249,14 @@ def image_class_to_json(image):
   return s
 
 def save_to_db(image):
+  print('save_to_db 0')
   try:
       api_response = api_instance.add_image(image)
       pprint(api_response)
   except ApiException as e:
       print("Exception when calling ImageApi->add_image: %s\n" % e)
+  print('save_to_db 1')
+
   return api_response.data._id
 
 def save_to_storage(image_info):
